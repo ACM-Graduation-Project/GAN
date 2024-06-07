@@ -41,6 +41,8 @@ image_size = 256
 batch_size = 32
 epochs = 1000
 num_classes = 16  # Change this according to your dataset
+seed = tf.random.normal([num_classes, 100])
+
 
 # Function to load and preprocess images
 def load_and_preprocess_image(file_path):
