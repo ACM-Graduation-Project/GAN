@@ -33,16 +33,26 @@ from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.models import load_model
 from PIL import Image
+import time
+
 
 # Define constants
 train_dir = '/content/data/Training'
 output_dir = '/content/generated_images'
 image_size = 256
-batch_size = 32
-epochs = 1000
-num_classes = 16  # Change this according to your dataset
-seed = tf.random.normal([num_classes, 100])
+batch_size = 16
+epochs = 2
 
+# Create a label mapping
+label_names = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+label_to_index = {name: index for index, name in enumerate(label_names)}
+num_classes = len(label_names)  # Number of classes
+
+# Create a lookup table
+keys_tensor = tf.constant(list(label_to_index.keys()))
+vals_tensor = tf.constant(list(label_to_index.values()))
+table = tf.lookup.StaticHashTable(
+    tf.lookup.KeyValueTensorInitializer(keys_tensor, vals_tensor), default_value=-1)
 
 # Function to load and preprocess images
 def load_and_preprocess_image(file_path):
@@ -52,14 +62,27 @@ def load_and_preprocess_image(file_path):
     img = img / 255.0  # Normalize to [0,1] range
     return img
 
+# Function to get label from file path
+def get_label(file_path):
+    parts = tf.strings.split(file_path, os.path.sep)
+    label = parts[-2]
+    return table.lookup(label)
+
+# Function to load image and label
+def load_image_and_label(file_path):
+    label = get_label(file_path)
+    image = load_and_preprocess_image(file_path)
+    return image, label
+
 # Load and preprocess images from directory
 train_dataset = tf.data.Dataset.list_files(train_dir + '/*/*')
-train_dataset = train_dataset.map(load_and_preprocess_image)
+train_dataset = train_dataset.map(load_image_and_label)
+train_dataset = train_dataset.shuffle(buffer_size=1000).batch(batch_size)
 
 # Define generator model
 def make_generator_model():
     model = tf.keras.Sequential()
-    model.add(layers.Dense(64*64*256, use_bias=False, input_shape=(100,)))
+    model.add(layers.Dense(64*64*256, use_bias=False, input_shape=(100 + num_classes,)))
     model.add(layers.BatchNormalization())
     model.add(layers.LeakyReLU())
 
@@ -84,7 +107,7 @@ def make_generator_model():
 # Define discriminator model
 def make_discriminator_model():
     model = tf.keras.Sequential()
-    model.add(layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=[image_size, image_size, 3]))
+    model.add(layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=[image_size, image_size, 3 + num_classes]))
     model.add(layers.LeakyReLU())
     model.add(layers.Dropout(0.3))
 
@@ -129,14 +152,26 @@ checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
 
 # Define training step function
 @tf.function
-def train_step(images):
+def train_step(images, labels):
     noise = tf.random.normal([batch_size, 100])
+    noise = tf.concat([noise, tf.one_hot(labels, num_classes)], axis=1)
 
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
         generated_images = generator(noise, training=True)
 
-        real_output = discriminator(images, training=True)
-        fake_output = discriminator(generated_images, training=True)
+        real_labels = tf.one_hot(labels, num_classes)
+        real_labels = tf.reshape(real_labels, [batch_size, 1, 1, num_classes])
+        real_labels = tf.tile(real_labels, [1, image_size, image_size, 1])
+
+        fake_labels = tf.one_hot(labels, num_classes)
+        fake_labels = tf.reshape(fake_labels, [batch_size, 1, 1, num_classes])
+        fake_labels = tf.tile(fake_labels, [1, image_size, image_size, 1])
+
+        real_input = tf.concat([images, real_labels], axis=-1)
+        fake_input = tf.concat([generated_images, fake_labels], axis=-1)
+
+        real_output = discriminator(real_input, training=True)
+        fake_output = discriminator(fake_input, training=True)
 
         gen_loss = generator_loss(fake_output)
         disc_loss = discriminator_loss(real_output, fake_output)
@@ -147,30 +182,45 @@ def train_step(images):
     generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
     discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
 
+    return gen_loss, disc_loss
+
 # Define function to generate and save images
-def generate_and_save_images(model, epoch, test_input):
+def generate_and_save_images(model, epoch, test_input, labels):
     predictions = model(test_input, training=False)
 
     # Create output directory if not exists
     os.makedirs(output_dir, exist_ok=True)
 
     for i in range(predictions.shape[0]):
-        class_folder = os.path.join(output_dir, f'class_{i}')
+        class_folder = os.path.join(output_dir, f'class_{labels[i].numpy()}')
         os.makedirs(class_folder, exist_ok=True)
-        cv2.imwrite(os.path.join(class_folder, f'image_{epoch}_{i}.jpg'), predictions[i].numpy() * 255)
+        cv2.imwrite(os.path.join(class_folder, f'image_{epoch}_{i}.jpg'), (predictions[i].numpy() * 127.5 + 127.5).astype(np.uint8))
 
 # Define main training loop
 def train(dataset, epochs):
     for epoch in range(epochs):
-        for image_batch in dataset:
-            train_step(image_batch)
+        start = time.time()
+        for image_batch, label_batch in dataset:
+            gen_loss, disc_loss = train_step(image_batch, label_batch)
+        
+        print(f'Epoch {epoch+1}, gen loss={gen_loss}, disc loss={disc_loss}')
 
         if (epoch + 1) % 50 == 0:
-            generate_and_save_images(generator, epoch + 1, seed)
+            noise = tf.random.normal([num_classes, 100])
+            noise = tf.concat([noise, tf.one_hot(tf.range(num_classes), num_classes)], axis=1)
+            generate_and_save_images(generator, epoch + 1, noise, tf.range(num_classes))
 
         # Save the model every 15 epochs
         if (epoch + 1) % 15 == 0:
             checkpoint.save(file_prefix=checkpoint_prefix)
+        
+        print(f'Time for epoch {epoch+1} is {time.time()-start} sec')
 
-# Train the model
-train(train_dataset.batch(batch_size), epochs)
+# Define seed for image generation
+num_classes = 16  # Update this according to dataset
+seed = tf.random.normal([num_classes, 100])
+seed = tf.concat([seed, tf.one_hot(tf.range(num_classes), num_classes)], axis=1)
+
+
+train(train_dataset, epochs)
+
